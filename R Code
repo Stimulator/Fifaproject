@@ -1,0 +1,183 @@
+library(caret)
+library(visNetwork)
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(Matrix)
+library(xgboost)
+options(scipen = 999)
+train <- read.csv("F:\\Study\\DAI\\Data Analysis\\pubg\\train_V2.csv")
+test <- read.csv("F:\\Study\\DAI\\Data Analysis\\pubg\\test_V2.csv")
+train$dataset <- '1_train'
+test$dataset <- '2_test'
+all_data <- rbindlist(list(train, test), idcol = F, use.names = T, fill = T)
+str(train)
+dim(test)
+na_val <- sapply(all_data, function(x) sum(is.na(x)))
+na_val[na_val > 0] %>% sort(decreasing = T)
+unq_val <- sapply(all_data, function(x)length(unique(x)))
+unq_val[unq_val == 1] %>% sort(decreasing = T)
+ggplot(data = all_data[dataset == '1_train'], aes(winPlacePerc)) +
+  geom_histogram(bins = 20) +
+  labs(title = 'Distribution of Target Variable')
+# compute correlation
+corr <- all_data[, -c('Id', 'groupId', 'matchId', 'dataset'), with = F] %>%
+  sapply(., as.numeric) %>%
+  as.data.table()
+corr <- cor(corr, use = 'pairwise.complete.obs')
+corr[upper.tri(corr)] <- NA
+corr <- melt(corr, na.rm = T) %>% as.data.table() %>% setorder(-value)
+corr$text <- ifelse(abs(corr$value) >= .8 & corr$value != 1, round(corr$value, 2), '')
+# plot correlation matrix
+ggplot(data = corr, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = 'white') +
+  geom_text(aes(label = text)) +
+  scale_fill_gradient2(low = 'blue', high = 'red', mid = 'white',
+                       midpoint = 0, limit = c(-1, 1),
+                       name = 'Pearson Correlation') +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = 'Correlation Matrix')
+table(all_data$maxPlace - all_data$numGroups)
+# group win placement into decile groups
+dist <- all_data[dataset == '1_train'] %>%
+  mutate(winPlacePerc_decile = ntile(winPlacePerc, 10)) %>%
+  group_by(winPlacePerc_decile) %>%
+  summarise(walk = mean(walkDistance),
+            ride = mean(rideDistance),
+            swim = mean(swimDistance)) %>%
+  ungroup() %>%
+  melt(., measure.vars = c('walk', 'ride', 'swim'),
+       variable.name = 'travel_mode', value.name = 'avg_distance') %>%
+  as.data.table()
+# factor decile groups
+lvls <- dist$winPlacePerc_decile %>% unique() %>% sort()
+dist$winPlacePerc_decile <- factor(dist$winPlacePerc_decile, levels = lvls)
+# plot barchart
+ggplot(data = dist, aes(x = winPlacePerc_decile, y = avg_distance, fill = travel_mode)) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  facet_grid(travel_mode ~ ., scales = 'free') +
+  labs(title = 'Travel Distance by Placement Decile')
+table(all_data$killStreaks)
+sharpshoot <- all_data[dataset == '1_train'] %>%
+  select(Id, headshotKills, kills, winPlacePerc) %>%
+  mutate(winPlacePerc = round(winPlacePerc, 2)) %>%
+  group_by(winPlacePerc) %>%
+  summarise(accuracy = mean(ifelse(kills == 0, 0, headshotKills / kills))) %>%
+  as.data.table()
+ggplot(data = sharpshoot, aes(x = winPlacePerc, y = accuracy)) +
+  geom_point() +
+  geom_smooth(method = 'loess') +
+  labs(title = 'The Sharpshooter')
+# identify size of team
+grp <- all_data[dataset == '1_train'] %>%
+  group_by(groupId) %>%
+  summarise(teamsize = n()) %>%
+  ungroup() %>%
+  as.data.table()
+# assess actual rate of friendly kill vs expected rate
+team <- all_data[dataset == '1_train'] %>%
+  select(Id, groupId, teamKills, kills, maxPlace, winPlacePerc) %>%
+  mutate(winPlacePerc = round(winPlacePerc, 2)) %>%
+  merge(x = ., y = grp, by = 'groupId', all.x = T) %>%
+  group_by(winPlacePerc) %>%
+  summarise(exp_prob = mean((teamsize - 1) / (maxPlace - 1), na.rm = T),
+            actual_prob = mean(ifelse(teamsize == 1, 0, teamKills / (teamsize - 1))),
+            lift = ifelse(exp_prob == 0, 0, actual_prob / exp_prob)) %>%
+  ungroup() %>%
+  as.data.table()
+ggplot(data = team, aes(x = winPlacePerc, y = lift)) +
+  geom_point() +
+  geom_smooth(method = 'loess') +
+  labs(title = 'The Team Player')
+test <- all_data[dataset == '2_test']
+train <- all_data[dataset == '1_train']
+# 30% of training data for validation
+k <- all_data[dataset == '1_train'] %>% nrow()
+smp_size <- floor(0.3 * k)
+
+set.seed(123)
+val_ind <- sample(seq_len(k), size = smp_size)
+
+val <- train[val_ind]
+train <- train[-val_ind]
+
+# label dataset
+train$dataset <- '1_train'
+val$dataset <- '1_validation'
+test$dataset <- '2_test'
+
+all_data <- rbindlist(list(train, val, test), idcol = F, use.names = T, fill = T)
+
+train_end <- nrow(all_data[dataset == '1_train'])
+val_start <- train_end + 1
+val_end <- all_data[substr(dataset, 1, 1) == '1'] %>% nrow()
+test_start <- val_end + 1
+test_end <- all_data %>% nrow()
+
+# create data matrix for xgboost
+dmatrix <- all_data %>%
+  select(-Id, -groupId, -matchId, -dataset, -winPlacePerc) %>%
+  sparse.model.matrix(~ . - 1, data = .)
+dtrain <- xgb.DMatrix(data = dmatrix[1:train_end, ], label = all_data[1:train_end]$winPlacePerc)
+dval <- xgb.DMatrix(data = dmatrix[val_start:val_end, ], label = all_data[val_start:val_end]$winPlacePerc)
+dtest <- xgb.DMatrix(data = dmatrix[test_start:test_end, ])
+
+# features used for model
+cols <- all_data %>%
+  select(-Id, -groupId, -matchId, -dataset, -winPlacePerc) %>%
+  colnames()
+cols
+
+# shrink all_data table for memory efficiency
+all_data <- all_data[, 'Id']
+
+# model hyperparameters
+p <- list(objective = 'reg:linear',
+          booster = 'gbtree',
+          eval_metric = 'mae',
+          eta = .1,
+          max_depth = 6,
+          min_child_weight = 1,
+          gamma = 0,
+          subsample = .4,
+          colsample_bytree = .4)
+
+# model hyperparameters
+p <- list(objective = 'reg:linear',
+          booster = 'gbtree',
+          eval_metric = 'mae',
+          eta = .1,
+          max_depth = 6,
+          min_child_weight = 1,
+          gamma = 0,
+          subsample = .4,
+          colsample_bytree = .4)
+
+xgb_model <- xgb.train(params = p,
+                       data = dtrain,
+                       nrounds = 1000,
+                       watchlist = list(train = dtrain, validation = dval),
+                       early_stopping_rounds = 200,
+                       verbose = T,
+                       print_every_n = 200,
+                       maximize = F)
+# feature importance
+varimp <- xgb.importance(cols, model = xgb_model)
+
+# plot feature importance
+ggplot(data = varimp, aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_bar(stat = 'identity') +
+  guides(fill = F) +
+  labs(title = 'Feature Importance', x = 'Feature', y = 'Importance') +
+  coord_flip()
+
+# prediction and submission file
+preds <- predict(xgb_model, dtest)
+preds <- ifelse(preds > 1, 1, preds)
+preds <- ifelse(preds < 0, 0, preds)
+submission <- data.table(Id = all_data[test_start:test_end]$Id,
+                         winPlacePerc = preds)
+
+
+fwrite(submission, paste0('xgb_baseline_', xgb_model$best_score, '.csv'), quote = T)
+head(submission)
